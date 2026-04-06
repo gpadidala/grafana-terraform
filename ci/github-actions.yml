@@ -1,0 +1,403 @@
+name: "Grafana Terraform CI/CD"
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "*.tf"
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - "dashboards/**"
+      - "modules/**"
+      - "environments/**"
+
+  push:
+    branches: [main]
+    paths:
+      - "*.tf"
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - "dashboards/**"
+      - "modules/**"
+      - "environments/**"
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - staging
+          - prod
+      version:
+        description: "Release version (e.g. 1.2.3)"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run (plan only, no apply)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_VERSION: "1.7.x"
+
+# ---------------------------------------------------------------------------
+# Concurrency: only one workflow per environment at a time
+# ---------------------------------------------------------------------------
+concurrency:
+  group: terraform-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================================
+  # Job: Validate
+  # =========================================================================
+  validate:
+    name: "Validate"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: Terraform Init (validation only)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Lint Dashboard JSON
+        id: json_lint
+        run: |
+          echo "Validating dashboard JSON files..."
+          errors=0
+          for f in $(find dashboards/ -name "*.json" -o -name "*.json.tmpl" 2>/dev/null); do
+            if ! jq empty "${f}" 2>/dev/null; then
+              echo "ERROR: Invalid JSON in ${f}" >&2
+              errors=$((errors + 1))
+            fi
+          done
+          if [[ ${errors} -gt 0 ]]; then
+            echo "Found ${errors} invalid JSON file(s)."
+            exit 1
+          fi
+          echo "All dashboard JSON files are valid."
+
+      - name: Post Validation Results (PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fmt = '${{ steps.fmt.outcome }}';
+            const validate = '${{ steps.validate.outcome }}';
+            const jsonLint = '${{ steps.json_lint.outcome }}';
+
+            const body = `### Terraform Validation Results
+
+            | Check | Status |
+            |-------|--------|
+            | Format | ${fmt === 'success' ? '✅ Passed' : '❌ Failed'} |
+            | Validate | ${validate === 'success' ? '✅ Passed' : '❌ Failed'} |
+            | Dashboard JSON | ${jsonLint === 'success' ? '✅ Passed' : '❌ Failed'} |
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # =========================================================================
+  # Job: Plan
+  # =========================================================================
+  plan:
+    name: "Plan (${{ matrix.environment }})"
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    environment: ${{ matrix.environment }}
+
+    env:
+      GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+      GRAFANA_AUTH: ${{ secrets.GRAFANA_AUTH }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Determine Version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "version=$(cat VERSION)" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="environments/${{ matrix.environment }}/backend.hcl"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -no-color \
+            -detailed-exitcode \
+            -var-file="environments/${{ matrix.environment }}/terraform.tfvars" \
+            -var="platform_version=${{ steps.version.outputs.version }}" \
+            -out="tfplan-${{ matrix.environment }}" \
+            2>&1 | tee plan-output.txt
+        continue-on-error: true
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: tfplan-${{ matrix.environment }}
+          retention-days: 5
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let planOutput = fs.readFileSync('plan-output.txt', 'utf8');
+
+            // Truncate if too long for a comment
+            const maxLength = 60000;
+            if (planOutput.length > maxLength) {
+              planOutput = planOutput.substring(0, maxLength) + '\n\n... (truncated)';
+            }
+
+            const body = `### Terraform Plan - ${{ matrix.environment }}
+
+            <details><summary>Show Plan Output</summary>
+
+            \`\`\`hcl
+            ${planOutput}
+            \`\`\`
+
+            </details>
+
+            **Plan exit code:** \`${{ steps.plan.outcome }}\`
+            **Version:** \`${{ steps.version.outputs.version }}\`
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail on Plan Error
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # =========================================================================
+  # Job: Apply Staging (automatic on push to main)
+  # =========================================================================
+  apply-staging:
+    name: "Apply (staging)"
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+
+    env:
+      GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+      GRAFANA_AUTH: ${{ secrets.GRAFANA_AUTH }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Determine Version
+        id: version
+        run: echo "version=$(cat VERSION)" >> "${GITHUB_OUTPUT}"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="environments/staging/backend.hcl"
+
+      - name: Terraform Apply
+        id: apply
+        run: |
+          terraform apply \
+            -auto-approve \
+            -var-file="environments/staging/terraform.tfvars" \
+            -var="platform_version=${{ steps.version.outputs.version }}"
+
+    outputs:
+      apply_outcome: ${{ steps.apply.outcome }}
+
+  # =========================================================================
+  # Job: Apply Production (manual dispatch only)
+  # =========================================================================
+  apply-prod:
+    name: "Apply (prod)"
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod' && github.event.inputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    environment: prod
+
+    env:
+      GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+      GRAFANA_AUTH: ${{ secrets.GRAFANA_AUTH }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="environments/prod/backend.hcl"
+
+      - name: Terraform Apply
+        id: apply
+        run: |
+          terraform apply \
+            -auto-approve \
+            -var-file="environments/prod/terraform.tfvars" \
+            -var="platform_version=${{ github.event.inputs.version }}"
+
+    outputs:
+      apply_outcome: ${{ steps.apply.outcome }}
+
+  # =========================================================================
+  # Job: Notify (Slack)
+  # =========================================================================
+  notify:
+    name: "Notify"
+    needs: [apply-staging, apply-prod]
+    if: always() && (needs.apply-staging.result != 'skipped' || needs.apply-prod.result != 'skipped')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine Status
+        id: status
+        run: |
+          staging="${{ needs.apply-staging.result }}"
+          prod="${{ needs.apply-prod.result }}"
+
+          if [[ "${staging}" == "success" || "${prod}" == "success" ]]; then
+            echo "status=success" >> "${GITHUB_OUTPUT}"
+            echo "emoji=:white_check_mark:" >> "${GITHUB_OUTPUT}"
+          elif [[ "${staging}" == "failure" || "${prod}" == "failure" ]]; then
+            echo "status=failure" >> "${GITHUB_OUTPUT}"
+            echo "emoji=:x:" >> "${GITHUB_OUTPUT}"
+          else
+            echo "status=skipped" >> "${GITHUB_OUTPUT}"
+            echo "emoji=:fast_forward:" >> "${GITHUB_OUTPUT}"
+          fi
+
+          if [[ "${prod}" != "skipped" ]]; then
+            echo "environment=prod" >> "${GITHUB_OUTPUT}"
+          else
+            echo "environment=staging" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Send Slack Notification
+        if: steps.status.outputs.status != 'skipped'
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.emoji }} Grafana Terraform ${{ steps.status.outputs.status }} on *${{ steps.status.outputs.environment }}*",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Grafana Terraform Deployment"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Status:*\n${{ steps.status.outputs.status }}" },
+                    { "type": "mrkdwn", "text": "*Environment:*\n${{ steps.status.outputs.environment }}" },
+                    { "type": "mrkdwn", "text": "*Ref:*\n${{ github.ref_name }}" },
+                    { "type": "mrkdwn", "text": "*Actor:*\n${{ github.actor }}" }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "View Run" },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
