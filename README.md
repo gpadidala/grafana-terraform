@@ -110,6 +110,216 @@ Built for Fortune 500 scale: 5,000+ users across C-suite executives, VPs, Direct
 
 ## Architecture
 
+### High-Level System Architecture
+
+```mermaid
+flowchart TB
+    subgraph devs["Developers / Platform Team"]
+        dev["Engineer / SRE"]
+        pr["Pull Request"]
+    end
+
+    subgraph git["Source Control"]
+        repo["grafana-terraform<br/>main branch"]
+        envs["environments/<br/>prod · staging · dev"]
+        dashes["dashboards/<br/>L0-L3 JSON files"]
+    end
+
+    subgraph ci["CI/CD · GitHub Actions"]
+        validate["1 - validate<br/>terraform fmt + validate"]
+        plan["2 - plan<br/>post diff to PR"]
+        apply_stg["3 - apply staging<br/>on merge to main"]
+        apply_prd["4 - apply prod<br/>manual dispatch"]
+    end
+
+    subgraph tf["Terraform Core"]
+        state[("S3 remote state<br/>+ DynamoDB lock")]
+        modules["15 modules<br/>30 resource types"]
+        provider["grafana/grafana<br/>provider &gt;= 3.0"]
+    end
+
+    subgraph grafana["Grafana Enterprise · Target"]
+        api["Grafana REST API"]
+        orgs_n_sas["Orgs · Users · SAs · Teams"]
+        rbac_n_perms["RBAC · Folder Perms"]
+        ds["Data Sources"]
+        dash_n_alerts["Dashboards · Library Panels<br/>Alerts · Reports · Playlists"]
+    end
+
+    subgraph lgtm["Observability Backends"]
+        mimir[("Mimir<br/>Metrics")]
+        loki[("Loki<br/>Logs")]
+        tempo[("Tempo<br/>Traces")]
+        pyro[("Pyroscope<br/>Profiles")]
+        am[("Alertmanager")]
+    end
+
+    dev --> pr --> repo
+    envs --> repo
+    dashes --> repo
+    repo --> validate --> plan --> apply_stg --> apply_prd
+    apply_stg --> provider
+    apply_prd --> provider
+    provider <--> state
+    provider --> modules --> api
+    api --> orgs_n_sas
+    api --> rbac_n_perms
+    api --> ds
+    api --> dash_n_alerts
+    ds -.query.-> mimir
+    ds -.query.-> loki
+    ds -.query.-> tempo
+    ds -.query.-> pyro
+    dash_n_alerts -.route.-> am
+```
+
+### End-to-End Deployment Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Platform Engineer
+    participant Git as GitHub Repo
+    participant CI as GitHub Actions
+    participant TF as Terraform Core
+    participant S3 as S3 State + Lock
+    participant API as Grafana API
+    participant LGTM as LGTM Backends
+
+    Dev->>Git: Open PR (dashboard/module change)
+    Git->>CI: Trigger validate + plan
+    CI->>TF: terraform fmt / validate
+    CI->>TF: terraform plan
+    TF->>S3: Acquire state lock
+    TF->>API: Read current state (refresh)
+    TF-->>CI: Plan output
+    CI->>Git: Post plan diff as PR comment
+    Dev->>Git: Merge to main
+    Git->>CI: Trigger apply (staging)
+    CI->>TF: terraform apply (staging)
+    TF->>S3: Update state
+    TF->>API: Create/Update resources (phases 1-8)
+    API-->>TF: Resource IDs + UIDs
+    TF->>API: grafana_annotation (deploy marker)
+    Note over Dev,API: Manual verification in staging
+    Dev->>CI: workflow_dispatch (prod)
+    CI->>TF: terraform apply (prod, version=X.Y.Z)
+    TF->>API: Apply same 8-phase deployment
+    API->>LGTM: Datasources query Mimir/Loki/Tempo/Pyroscope
+    TF-->>CI: Apply complete
+    CI->>Dev: Slack notification (success/failure)
+```
+
+### Module Dependency Graph
+
+```mermaid
+flowchart LR
+    orgs["1 organizations"]
+    sas["2 service-accounts"]
+    users["2 users"]
+    teams["3 teams"]
+    folders["4 folders"]
+    ds["4 datasources"]
+    dashes["5 dashboards"]
+    libp["5 library-panels"]
+    alerts["6 alerting"]
+    rbac["7 rbac"]
+    dperms["7 dashboard-permissions"]
+    sso["8 sso"]
+    reports["8 reports"]
+    playlists["8 playlists"]
+    prefs["8 preferences"]
+
+    orgs --> sas
+    orgs --> users
+    orgs --> teams
+    users --> teams
+    teams --> folders
+    orgs --> ds
+    folders --> dashes
+    ds --> dashes
+    folders --> libp
+    ds --> libp
+    folders --> alerts
+    ds --> alerts
+    teams --> rbac
+    folders --> rbac
+    dashes --> dperms
+    teams --> dperms
+    folders --> dperms
+    orgs --> sso
+    dashes --> reports
+    dashes --> playlists
+    teams --> prefs
+    dashes --> prefs
+    folders --> prefs
+```
+
+### LGTM Correlation Flow
+
+```mermaid
+flowchart LR
+    user((Engineer))
+    metric["Metric Spike<br/>(Mimir)"]
+    trace["Exemplar Trace<br/>(Tempo)"]
+    log["Correlated Logs<br/>(Loki)"]
+    prof["CPU Profile<br/>(Pyroscope)"]
+
+    user -->|click spike| metric
+    metric -->|exemplarTraceIdDestinations| trace
+    trace -->|tracesToLogsV2| log
+    trace -->|tracesToProfiles| prof
+    trace -->|tracesToMetrics| metric
+    trace -->|serviceMap| metric
+    log -->|derivedFields traceID| trace
+
+    style metric fill:#e08b42,color:#fff
+    style log fill:#2e7d32,color:#fff
+    style trace fill:#1565c0,color:#fff
+    style prof fill:#6a1b9a,color:#fff
+```
+
+**The whole correlation graph is wired declaratively in `modules/datasources/main.tf`.** Click a metric spike -> jump to the trace -> jump to the logs -> jump to the CPU profile. No manual datasource wiring required.
+
+### End-to-End Validation Flow
+
+```mermaid
+flowchart TB
+    start(["Run: bash tests/e2e-test.sh"])
+    health["1 Health<br/>version, org, auth"]
+    fold["2 Folders<br/>CRUD + perms"]
+    teams["3 Teams<br/>CRUD + members + prefs"]
+    users["4 Users<br/>CRUD + role"]
+    sa["5 Service Accounts<br/>CRUD + tokens + bearer auth"]
+    ds["6 Data Sources<br/>Prometheus + Loki"]
+    dash["7 Dashboards<br/>CRUD + perms + snapshots"]
+    libp["8 Library Panels"]
+    alert["9 Alerting<br/>CP + policies + rules + mute"]
+    rbac["10 RBAC<br/>perms + scope + action"]
+    plugin["11 Plugins<br/>install + upgrade"]
+    prefs["12 Preferences"]
+    ann["13 Annotations"]
+    cleanup["Cleanup via trap<br/>reverse-order delete"]
+    report["tests/test-results.md<br/>74 PASS · 0 FAIL · 2 SKIP"]
+
+    start --> health --> fold --> teams --> users --> sa --> ds --> dash
+    dash --> libp --> alert --> rbac --> plugin --> prefs --> ann
+    ann --> cleanup --> report
+```
+
+Every test creates resources with a unique `e2e-<timestamp>-*` prefix and registers a cleanup handler. On exit (success or failure), a `trap` fires to delete all created resources in reverse creation order. Re-runnable indefinitely with zero leftover state.
+
+Run it yourself:
+
+```bash
+GRAFANA_URL=http://localhost:3200/ GRAFANA_USER=admin GRAFANA_PASS=admin \
+  bash tests/e2e-test.sh
+```
+
+See [tests/test-results.md](tests/test-results.md) for the full test matrix.
+
+---
+
 ### 8-Phase Deployment Order
 
 Every resource is deployed in strict dependency order to avoid race conditions:
